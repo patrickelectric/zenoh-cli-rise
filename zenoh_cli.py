@@ -12,10 +12,14 @@ import argparse
 from base64 import b64decode, b64encode
 from typing import Dict, Callable
 import threading
+import webbrowser
+import tempfile
 
 import zenoh
 import parse
 import networkx as nx
+from pyvis.network import Network
+from jsonpointer import resolve_pointer
 
 
 logger = logging.getLogger("zenoh-cli")
@@ -175,16 +179,6 @@ def network(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ):
-    import matplotlib
-    import matplotlib.pyplot as plt
-
-    plt.style.use("dark_background")
-    from jsonpointer import resolve_pointer
-
-    # Check if we're in an interactive environment
-    plt_backend = matplotlib.get_backend()
-    is_interactive = plt_backend in ["TkAgg", "Qt5Agg", "Qt4Agg", "WXAgg"]
-
     graph = nx.Graph()
 
     me = str(session.info.zid())
@@ -236,20 +230,9 @@ def network(
             )
             pass
 
-    pos = nx.spring_layout(graph, seed=3113794652)
-
-    # Nodes
-    routers = [
-        node for node, attrs in graph.nodes.items() if attrs["whatami"] == "router"
-    ]
-    peers = [node for node, attrs in graph.nodes.items() if attrs["whatami"] == "peer"]
-    clients = [
-        node for node, attrs in graph.nodes.items() if attrs["whatami"] == "client"
-    ]
-
-    info = session.info
-
-    me = str(info.zid())
+    # Create Pyvis network
+    net = Network(height="750px", width="100%", bgcolor="#222222", font_color="white")
+    # net.set_template("dark")
 
     # Node labels
     labels = {
@@ -258,73 +241,42 @@ def network(
     }
     labels[me] = "Me!"
 
-    nx.draw_networkx(
-        graph,
-        pos,
-        nodelist=routers,
-        edgelist=[],
-        node_color="steelblue",
-        node_size=500,
-        with_labels=False,
-    )
-    nx.draw_networkx(
-        graph,
-        pos,
-        nodelist=peers,
-        edgelist=[],
-        node_color="aliceblue",
-        with_labels=False,
-    )
-    nx.draw_networkx(
-        graph,
-        pos,
-        nodelist=clients,
-        edgelist=[],
-        node_color="Lightgreen",
-        with_labels=False,
-    )
+    # Add nodes with appropriate colors
+    for node, attrs in graph.nodes(data=True):
+        whatami = attrs.get("whatami", "")
+        color = {
+            "router": "#4682B4",  # steelblue
+            "peer": "#F0F8FF",  # aliceblue
+            "client": "#90EE90",  # lightgreen
+        }.get(
+            whatami, "#F08080"
+        )  # lightcoral for others
 
-    nx.draw_networkx(
-        graph,
-        pos,
-        nodelist=[me],
-        edgelist=[],
-        node_color="lightcoral",
-        with_labels=False,
-    )
+        if node == me:
+            color = "#F08080"  # lightcoral for self
 
-    nx.draw_networkx_labels(
-        graph, pos, labels, font_color="darkgrey", font_weight="bold"
-    )
+        net.add_node(
+            node,
+            label=labels.get(node, node[:5]),
+            color=color,
+            size=30 if whatami == "router" else 20,
+        )
 
-    # Edges
-    nx.draw_networkx(
-        graph,
-        pos,
-        nodelist=[],
-        edge_color="white",
-        with_labels=False,
-    )
-    nx.draw_networkx_edge_labels(
-        graph,
-        pos,
-        edge_labels=nx.get_edge_attributes(graph, "protocol"),
-        rotate=False,
-        font_color="black",
-    )
-    plt.tight_layout()
-    plt.axis("off")
-    if is_interactive:
-        plt.show()
-    else:
-        output_file = "zenoh_network.png"
-        plt.savefig(output_file)
-        print(f"Using backend: {plt_backend}")
-        print(f"Network visualization saved to {os.path.abspath(output_file)}")
-        plt.close()
+    # Add edges with protocol labels
+    for edge in graph.edges(data=True):
+        source, target, data = edge
+        protocol = data.get("protocol", "")
+        net.add_edge(
+            source,
+            target,
+            label=protocol,
+        )
 
-
-# Bundled codecs
+    # Create a temporary file and show the network
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+        net.save_graph(tmp.name)
+        webbrowser.open("file://" + tmp.name)
+        print("Network visualization opened in your default web browser.")
 
 
 # Text codec
