@@ -14,6 +14,7 @@ from typing import Dict, Callable
 import threading
 import webbrowser
 import tempfile
+import re
 
 import zenoh
 import parse
@@ -179,49 +180,73 @@ def network(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ):
+    def extract_ip(addr):
+        # Extract IP from addresses like 'tcp/192.168.31.179:7447' or 'tcp/[::ffff:127.0.0.1]:50850'
+        match = re.search(r'(?:\[::ffff:)?(\d+\.\d+\.\d+\.\d+)(?:\])?', addr)
+        return match.group(1) if match else None
+
     graph = nx.Graph()
 
     me = str(session.info.zid())
     graph.add_node(me, whatami=config.get_json("mode"))
 
     # Scout the nearby network
-    scout = zenoh.scout(what="peer|router")
+    scout = zenoh.scout(what="client|peer|router")
     threading.Timer(1.0, lambda: scout.stop()).start()
 
     for answer in scout:
+        logging.debug("--------------------------------")
         logging.debug("Scout answer: %s", answer)
         logging.debug("Scout answer zid: %s", answer.zid)
         logging.debug("Scout answer whatami: %s", answer.whatami)
 
-        graph.add_node(str(answer.zid), whatami=str(answer.whatami))
+        # Extract IPs from locators in scout answer
+        scout_ips = set()
+        for locator in answer.locators:
+            if ip := extract_ip(locator):
+                scout_ips.add(ip)
+
+        graph.add_node(str(answer.zid), whatami=str(answer.whatami), ips=scout_ips)
 
     # Query routers for more information
     for response in session.get("@/*/router"):
         if response.ok:
-            logging.debug("Received router response: %s", response.ok.payload)
+            #logging.debug("Received router response: %s", response.ok.payload)
             data = json.loads(response.ok.payload.to_string())
+            print(data)
 
             # Start adding edges and nodes
             zid = data["zid"]
             metadata = data["metadata"]
-            graph.add_node(zid, whatami="router", metadata=metadata)
+
+            # Extract IPs from locators
+            router_ips = set()
+            for locator in data.get("locators", []):
+                if ip := extract_ip(locator):
+                    router_ips.add(ip)
+
+            # Update or add router node with IPs
+            if zid in graph:
+                graph.nodes[zid]["ips"].update(router_ips)
+            else:
+                graph.add_node(zid, whatami="router", metadata=metadata, ips=router_ips)
+
             for sess in data["sessions"]:
                 peer = sess["peer"]
                 whatami = sess["whatami"]
 
-                try:
-                    # Zenohd >= 1.4.0
-                    link_protocols = ",".join(
-                        [link["src"].split("/")[0] for link in sess["links"]]
-                    )
-                except TypeError:
-                    # Zenohd < 1.4.0
-                    link_protocols = ",".join(
-                        [link.split("/")[0] for link in sess["links"]]
-                    )
+                # Extract IPs from links
+                peer_ips = set()
+                for link in sess["links"]:
+                    if ip := extract_ip(link):
+                        peer_ips.add(ip)
 
-                graph.add_node(peer, whatami=whatami)
-                graph.add_edge(zid, peer, protocol=link_protocols)
+                # Update or add peer node with IPs
+                if peer in graph:
+                    graph.nodes[peer]["ips"].update(peer_ips)
+                else:
+                    graph.add_node(peer, whatami=whatami, ips=peer_ips)
+                graph.add_edge(zid, peer, protocol="tcp")
 
         else:
             logger.error(
@@ -231,26 +256,58 @@ def network(
             pass
 
     # Create Pyvis network
-    net = Network(height="750px", width="100%", bgcolor="#222222", font_color="white")
-    # net.set_template("dark")
+    net = Network(height="1024", width="100%", bgcolor="#222222", font_color="white")
 
-    # Node labels
-    labels = {
-        zid: resolve_pointer(attributes, f"/metadata{args.metadata_field}", zid[:5])
-        for zid, attributes in graph.nodes(data=True)
-    }
-    labels[me] = "Me!"
+    # Group nodes by IP
+    ip_groups = {}
+    for node, attrs in graph.nodes(data=True):
+        ips = attrs.get("ips", set())
+        for ip in ips:
+            if ip not in ip_groups:
+                ip_groups[ip] = []
+            ip_groups[ip].append(node)
+
+    # Create group identifiers
+    group_identifiers = {ip: f"G{i+1}" for i, ip in enumerate(sorted(ip_groups.keys()))}
+
+    # Create legend nodes
+    legend_y = 0
+    for ip, group_id in group_identifiers.items():
+        net.add_node(
+            f"legend_{group_id}",
+            label=f"{group_id}: {ip}",
+            color="transparent",
+            font={"size": 14, "color": "white"},
+            x=0,
+            y=legend_y,
+            fixed=True
+        )
+        legend_y += 30
+
+    # Node labels with group identifiers
+    labels = {}
+    for zid, attributes in graph.nodes(data=True):
+        ips = attributes.get("ips", set())
+        group_ids = [group_identifiers[ip] for ip in ips if ip in group_identifiers]
+        group_suffix = f" ({', '.join(group_ids)})" if group_ids else ""
+
+        if zid == me:
+            labels[zid] = f"Me!{group_suffix}"
+        else:
+            base_label = resolve_pointer(attributes, f"/metadata{args.metadata_field}", zid[:5])
+            labels[zid] = f"{base_label}{group_suffix}"
 
     # Add nodes with appropriate colors
     for node, attrs in graph.nodes(data=True):
+        if node.startswith("legend_"):
+            continue
+
         whatami = attrs.get("whatami", "")
         color = {
             "router": "#4682B4",  # steelblue
-            "peer": "#F0F8FF",  # aliceblue
+            "peer": "#F0F8FF",    # aliceblue
             "client": "#90EE90",  # lightgreen
-        }.get(
-            whatami, "#F08080"
-        )  # lightcoral for others
+        }.get(whatami, "#F08080")  # lightcoral for others
 
         if node == me:
             color = "#F08080"  # lightcoral for self
@@ -259,7 +316,7 @@ def network(
             node,
             label=labels.get(node, node[:5]),
             color=color,
-            size=30 if whatami == "router" else 20,
+            size=30 if whatami == "router" else 20
         )
 
     # Add edges with protocol labels
@@ -270,7 +327,30 @@ def network(
             source,
             target,
             label=protocol,
+            font={"size": 10, "color": "white"},
+            color="white"
         )
+
+    # Configure physics for better grouping
+    net.set_options("""
+    {
+        "physics": {
+            "forceAtlas2Based": {
+                "gravitationalConstant": -50,
+                "centralGravity": 0.01,
+                "springLength": 200,
+                "springConstant": 0.08
+            },
+            "maxVelocity": 50,
+            "solver": "forceAtlas2Based",
+            "timestep": 0.35,
+            "stabilization": {
+                "enabled": true,
+                "iterations": 1000
+            }
+        }
+    }
+    """)
 
     # Create a temporary file and show the network
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
