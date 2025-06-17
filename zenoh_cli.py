@@ -5,6 +5,7 @@ import json
 import time
 import atexit
 import logging
+import os
 import pathlib
 import warnings
 import argparse
@@ -174,10 +175,15 @@ def network(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ):
+    import matplotlib
     import matplotlib.pyplot as plt
 
     plt.style.use("dark_background")
     from jsonpointer import resolve_pointer
+
+    # Check if we're in an interactive environment
+    plt_backend = matplotlib.get_backend()
+    is_interactive = plt_backend in ["TkAgg", "Qt5Agg", "Qt4Agg", "WXAgg"]
 
     graph = nx.Graph()
 
@@ -301,7 +307,14 @@ def network(
     )
     plt.tight_layout()
     plt.axis("off")
-    plt.show()
+    if is_interactive:
+        plt.show()
+    else:
+        output_file = "zenoh_network.png"
+        plt.savefig(output_file)
+        print(f"Using backend: {plt_backend}")
+        print(f"Network visualization saved to {os.path.abspath(output_file)}")
+        plt.close()
 
 
 # Bundled codecs
