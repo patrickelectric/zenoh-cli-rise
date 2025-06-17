@@ -19,7 +19,7 @@ dependencies = [
     "eclipse-zenoh>=1.2.1",
     "parse",
     "networkx",
-    "matplotlib",
+    "pyvis",
     "jsonpointer",
     "importlib_metadata; python_version < '3.10'"
 ]
